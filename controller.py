@@ -6,13 +6,27 @@ from vis import predict_gap
 
 BASE = "http://127.0.0.1:5000"
 
-# ── tunables ─────────────────────────────────────────────────────────────────
-CRUISE_ALTITUDE   = 2.0     # y: target flight height (matches drone start_pos y=2.0)
-LATERAL_GAIN      = 3.5     # how aggressively to correct left/right (x)
-ALTITUDE_GAIN     = 1.5     # how aggressively to correct altitude (y)
-FORWARD_SPEED     = 0.35    # z units added per loop tick when gate is visible
-FORWARD_SEARCH    = 0.08    # z units added when no gate detected (creep forward)
-LOOP_DT           = 0.05    # seconds between control ticks
+# Physics constants (must match physics.py)
+GRAVITY    = 4.0
+ATTRACT_K  = 3.0
+# To hover at any altitude, target_y must be GRAVITY/ATTRACT_K above current pos
+HOVER_BIAS = GRAVITY / ATTRACT_K   # = 1.333 — always add this to target_y
+
+# ── tunables ──────────────────────────────────────────────────────────────────
+CRUISE_ALTITUDE = 2.5   # default flight altitude when no gate detected
+
+# Lateral gain: gap_x * LATERAL_GAIN added to current x each tick
+LATERAL_GAIN    = 0.20
+
+# Altitude gain: how much above cruise to push per unit of gap_y
+ALTITUDE_GAIN   = 0.8
+
+# Forward speed
+Z_STEP_SEARCH   = 0.12   # creep forward when gate not visible
+Z_STEP_MIN      = 0.10   # minimum forward push when gate visible (close)
+Z_STEP_MAX      = 0.25   # maximum forward push when gate visible (far)
+
+LOOP_DT         = 0.05
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -31,12 +45,6 @@ def get_status():
 
 
 def move(x, y, z):
-    """
-    World axes (from README / physics.py):
-        x = left / right
-        y = altitude  (ground ≈ 0.3, ceiling ≈ 14)
-        z = forward depth  (gates are at z = 15, 30, 45 …)
-    """
     requests.post(
         f"{BASE}/control",
         json={"x": float(x), "y": float(y), "z": float(z), "yaw": 0.0}
@@ -51,20 +59,25 @@ def reset():
 reset()
 time.sleep(1.0)
 
-last_gap_x = 0.0
-last_gap_y = 0.0
+last_gap_x   = 0.0
+last_gap_y   = 0.0
 gate_visible = False
 
 # ── main loop ─────────────────────────────────────────────────────────────────
 while True:
-    status = get_status()
+    try:
+        status = get_status()
+    except Exception as e:
+        print("Status fetch failed:", e)
+        time.sleep(0.5)
+        continue
 
     if status["crashed"]:
         print("Crashed — resetting …")
         reset()
         time.sleep(1.0)
-        last_gap_x = 0.0
-        last_gap_y = 0.0
+        last_gap_x   = 0.0
+        last_gap_y   = 0.0
         gate_visible = False
         continue
 
@@ -77,31 +90,46 @@ while True:
     gap_x, gap_y, dist = predict_gap(frame)
 
     if gap_x == 0.0 and gap_y == 0.0:
-        # No detection — hold last known lateral/altitude offset, creep forward
-        gap_x = last_gap_x
-        gap_y = last_gap_y
+        gap_x        = last_gap_x
+        gap_y        = last_gap_y
         gate_visible = False
     else:
-        last_gap_x = gap_x
-        last_gap_y = gap_y
+        last_gap_x   = gap_x
+        last_gap_y   = gap_y
         gate_visible = True
 
-    # ── x: steer left/right toward gate center ────────────────────────────
-    # gap_x is in [-1, 1]: negative = gate is left of centre → move left (lower x)
+    # ── x: incremental lateral correction ────────────────────────────────
     target_x = pos["x"] + gap_x * LATERAL_GAIN
 
-    # ── y: correct altitude toward gate center ────────────────────────────
-    # gap_y is in [-1, 1]: positive = gate center is ABOVE camera center → fly up
-    target_y = CRUISE_ALTITUDE + gap_y * ALTITUDE_GAIN
+    # ── y: MUST include hover bias to fight gravity ───────────────────────
+    # The spring needs target_y = current_y + HOVER_BIAS just to hold altitude.
+    # Then we add gap_y * ALTITUDE_GAIN on top to actually steer toward gate center.
+    if gate_visible:
+        altitude_correction = gap_y * ALTITUDE_GAIN
+    else:
+        # Drift back toward cruise altitude
+        altitude_correction = (CRUISE_ALTITUDE - pos["y"]) * 0.3
 
-    # ── z: always push forward; scale with distance so we slow down a bit
-    # when very close (dist≈1) and go faster when far (dist≈5+)
-    forward_step = FORWARD_SPEED * min(dist, 3.0) if gate_visible else FORWARD_SEARCH
-    target_z = pos["z"] + forward_step
+    target_y = pos["y"] + HOVER_BIAS + altitude_correction
 
-    print(f"gap=({gap_x:+.2f}, {gap_y:+.2f}) dist={dist:.1f} | "
-          f"pos=({pos['x']:.1f},{pos['y']:.1f},{pos['z']:.1f}) | "
-          f"tgt=({target_x:.1f},{target_y:.1f},{target_z:.1f})")
+    # Safety clamp: never command below ground+margin or above ceiling
+    target_y = max(1.0, min(12.0, target_y))
+
+    # ── z: forward thrust, slow down if badly off-center ─────────────────
+    if gate_visible:
+        z_step = Z_STEP_MIN + (Z_STEP_MAX - Z_STEP_MIN) * min((dist - 1.0) / 4.0, 1.0)
+        lateral_error = abs(gap_x) + abs(gap_y)
+        if lateral_error > 0.5:
+            z_step *= 0.6   # slow down to let steering catch up
+    else:
+        z_step = Z_STEP_SEARCH
+
+    target_z = pos["z"] + z_step
+
+    print(f"{'SEE' if gate_visible else '   '} "
+          f"gap=({gap_x:+.2f},{gap_y:+.2f}) dist={dist:.1f} | "
+          f"pos=({pos['x']:+.2f},{pos['y']:.2f},{pos['z']:.2f}) | "
+          f"tgt=({target_x:+.2f},{target_y:.2f},{target_z:.2f})")
 
     move(target_x, target_y, target_z)
 
