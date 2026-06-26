@@ -1,12 +1,15 @@
 from ultralytics import YOLO
 import numpy as np
-import cv2 
+import cv2
 
 model = YOLO(r"C:\intern\runs\detect\train-12\weights\best.pt")
 
+RESIZED_W = 320
+RESIZED_H = 240
+
 def predict_gap(frame):
-    small = cv2.resize(frame, (320, 240))
-    results = model(small, conf=0.15)   
+    small = cv2.resize(frame, (RESIZED_W, RESIZED_H))
+    results = model(small, conf=0.15)
 
     boxes = results[0].boxes.xyxy.cpu().numpy()
 
@@ -22,11 +25,13 @@ def predict_gap(frame):
 
     x1, y1, x2, y2 = map(int, best_box)
 
-    cx = (x1 + x2) // 2
-    cy = (y1 + y2) // 2
+    cx = (x1 + x2) / 2.0
+    cy = (y1 + y2) / 2.0
 
-    gap_x = (cx - frame.shape[1]/2) / (frame.shape[1]/2)
-    gap_y = (frame.shape[0]/2 - cy) / (frame.shape[0]/2)
+    # FIX Bug 4: normalize against the RESIZED frame dimensions,
+    # not the original frame. Boxes come from the 320x240 inference.
+    gap_x = (cx - RESIZED_W / 2.0) / (RESIZED_W / 2.0)
+    gap_y = (RESIZED_H / 2.0 - cy) / (RESIZED_H / 2.0)
 
     box_width = x2 - x1
     dist = max(1.0, 300 / box_width)
