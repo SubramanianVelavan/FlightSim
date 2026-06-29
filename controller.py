@@ -1,67 +1,84 @@
-import requests
+"""
+Autonomy controller: fetches the FPV frame, perceives the gate (YOLO + SAM 3D
+via vis.py), and steers the drone through it over the sim's REST API.
+
+Run the sim first (python main.py in the sim repo), then:  python controller.py
+Point it at another machine with:  SIM_BASE=http://<host>:5000 python controller.py
+"""
+
+import os
 import time
+
 import cv2
 import numpy as np
-from vis import predict_gap
+import requests
 
-BASE = "http://127.0.0.1:5000"
+import vis
 
-# Physics constants (must match physics.py)
+BASE = os.environ.get("SIM_BASE", "http://127.0.0.1:5000")
+
+# Physics constants (mirror physics.py). To hold altitude the spring needs the
+# target_y biased GRAVITY/ATTRACT_K above current y — that cancels gravity.
 GRAVITY    = 4.0
 ATTRACT_K  = 3.0
-# To hover at any altitude, target_y must be GRAVITY/ATTRACT_K above current pos
-HOVER_BIAS = GRAVITY / ATTRACT_K   # = 1.333 — always add this to target_y
+HOVER_BIAS = GRAVITY / ATTRACT_K   # ≈ 1.333
 
 # ── tunables ──────────────────────────────────────────────────────────────────
-CRUISE_ALTITUDE = 2.5   # default flight altitude when no gate detected
-
-# Lateral gain: gap_x * LATERAL_GAIN added to current x each tick
-LATERAL_GAIN    = 0.20
-
-# Altitude gain: how much above cruise to push per unit of gap_y
-ALTITUDE_GAIN   = 0.8
-
-# Forward speed
-Z_STEP_SEARCH   = 0.12   # creep forward when gate not visible
-Z_STEP_MIN      = 0.10   # minimum forward push when gate visible (close)
-Z_STEP_MAX      = 0.25   # maximum forward push when gate visible (far)
-
+CRUISE_ALTITUDE = 2.5
+LATERAL_GAIN    = 0.20    # gap_x -> lateral target nudge
+ALTITUDE_GAIN   = 0.8     # gap_y -> altitude nudge
+Z_STEP_SEARCH   = 0.12    # creep forward when no gate is visible
+Z_STEP_MIN      = 0.10    # forward push when gate is close
+Z_STEP_MAX      = 0.25    # forward push when gate is far
 LOOP_DT         = 0.05
 # ─────────────────────────────────────────────────────────────────────────────
+
+session = requests.Session()
 
 
 def get_frame():
     try:
-        r = requests.get(f"{BASE}/frame", timeout=2)
-        img_array = np.frombuffer(r.content, np.uint8)
-        return cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+        r = session.get(f"{BASE}/frame", timeout=2)
+        return cv2.imdecode(np.frombuffer(r.content, np.uint8), cv2.IMREAD_COLOR)
     except Exception as e:
         print("Frame fetch failed:", e)
         return None
 
 
 def get_status():
-    return requests.get(f"{BASE}/status", timeout=2).json()
+    return session.get(f"{BASE}/status", timeout=2).json()
 
 
 def move(x, y, z):
-    requests.post(
-        f"{BASE}/control",
-        json={"x": float(x), "y": float(y), "z": float(z), "yaw": 0.0}
-    )
+    session.post(f"{BASE}/control",
+                 json={"x": float(x), "y": float(y), "z": float(z), "yaw": 0.0},
+                 timeout=2)
 
 
 def reset():
-    requests.post(f"{BASE}/reset")
+    session.post(f"{BASE}/reset", timeout=2)
+
+
+def load_intrinsics():
+    """Pull real camera focal length + gate width from the sim so vis.py's
+    distance estimate is exact. Harmless no-op against an older sim."""
+    try:
+        g = session.get(f"{BASE}/gates", timeout=2).json()
+        cam = g.get("camera", {})
+        gw = g.get("gates", [{}])[0].get("width") if g.get("gates") else None
+        vis.set_intrinsics(focal_px=cam.get("focal_px"), frame_w=cam.get("width"),
+                           frame_h=cam.get("height"), gate_width_m=gw)
+        print(f"[ctl] intrinsics: focal={cam.get('focal_px')} gate_w={gw}")
+    except Exception as e:
+        print(f"[ctl] /gates not available ({e}); using vis.py defaults")
 
 
 # ── startup ───────────────────────────────────────────────────────────────────
 reset()
 time.sleep(1.0)
+load_intrinsics()
 
-last_gap_x   = 0.0
-last_gap_y   = 0.0
-gate_visible = False
+last_gap_x = last_gap_y = 0.0
 
 # ── main loop ─────────────────────────────────────────────────────────────────
 while True:
@@ -72,13 +89,11 @@ while True:
         time.sleep(0.5)
         continue
 
-    if status["crashed"]:
+    if status.get("crashed"):
         print("Crashed — resetting …")
         reset()
         time.sleep(1.0)
-        last_gap_x   = 0.0
-        last_gap_y   = 0.0
-        gate_visible = False
+        last_gap_x = last_gap_y = 0.0
         continue
 
     frame = get_frame()
@@ -87,50 +102,39 @@ while True:
         continue
 
     pos = status["position"]
-    gap_x, gap_y, dist = predict_gap(frame)
+    det = vis.detect(frame)
 
-    if gap_x == 0.0 and gap_y == 0.0:
-        gap_x        = last_gap_x
-        gap_y        = last_gap_y
-        gate_visible = False
+    if det.found:
+        gap_x, gap_y = det.gap_x, det.gap_y
+        dist = det.distance
+        last_gap_x, last_gap_y = gap_x, gap_y
     else:
-        last_gap_x   = gap_x
-        last_gap_y   = gap_y
-        gate_visible = True
+        gap_x, gap_y = last_gap_x, last_gap_y
+        dist = 3.0
 
-    # ── x: incremental lateral correction ────────────────────────────────
+    # ── x: incremental lateral correction toward gate centre ──────────────
     target_x = pos["x"] + gap_x * LATERAL_GAIN
 
-    # ── y: MUST include hover bias to fight gravity ───────────────────────
-    # The spring needs target_y = current_y + HOVER_BIAS just to hold altitude.
-    # Then we add gap_y * ALTITUDE_GAIN on top to actually steer toward gate center.
-    if gate_visible:
+    # ── y: hover bias (fight gravity) + steer toward gate centre ──────────
+    if det.found:
         altitude_correction = gap_y * ALTITUDE_GAIN
     else:
-        # Drift back toward cruise altitude
         altitude_correction = (CRUISE_ALTITUDE - pos["y"]) * 0.3
-
     target_y = pos["y"] + HOVER_BIAS + altitude_correction
+    target_y = max(1.0, min(12.0, target_y))   # safety clamp
 
-    # Safety clamp: never command below ground+margin or above ceiling
-    target_y = max(1.0, min(12.0, target_y))
-
-    # ── z: forward thrust, slow down if badly off-center ─────────────────
-    if gate_visible:
+    # ── z: forward thrust, ease off when badly off-centre ─────────────────
+    if det.found:
         z_step = Z_STEP_MIN + (Z_STEP_MAX - Z_STEP_MIN) * min((dist - 1.0) / 4.0, 1.0)
-        lateral_error = abs(gap_x) + abs(gap_y)
-        if lateral_error > 0.5:
-            z_step *= 0.6   # slow down to let steering catch up
+        if abs(gap_x) + abs(gap_y) > 0.5:
+            z_step *= 0.6
     else:
         z_step = Z_STEP_SEARCH
-
     target_z = pos["z"] + z_step
 
-    print(f"{'SEE' if gate_visible else '   '} "
-          f"gap=({gap_x:+.2f},{gap_y:+.2f}) dist={dist:.1f} | "
-          f"pos=({pos['x']:+.2f},{pos['y']:.2f},{pos['z']:.2f}) | "
-          f"tgt=({target_x:+.2f},{target_y:.2f},{target_z:.2f})")
+    print(f"[{det.source:8}] gap=({gap_x:+.2f},{gap_y:+.2f}) dist={dist:4.1f}m "
+          f"pos=({pos['x']:+.2f},{pos['y']:.2f},{pos['z']:.2f}) "
+          f"spd={status.get('speed', 0):.2f} passed={status.get('gates_passed', 0)}")
 
     move(target_x, target_y, target_z)
-
     time.sleep(LOOP_DT)

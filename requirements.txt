@@ -1,3 +1,10 @@
-pygame>=2.5.0
-flask>=3.0.0
-pyinstaller>=6.0.0
+# Computer-vision client deps (talks to the sim over REST).
+requests>=2.31.0
+numpy>=1.24.0
+opencv-python>=4.8.0
+
+# Optional perception backends — install on the GPU box to enable YOLO + SAM 3D.
+# Without them, vis.py falls back to a classical HSV gate detector and still runs.
+# ultralytics>=8.0.0
+# torch>=2.1.0
+# sam2  @ git+https://github.com/facebookresearch/sam2.git   # Meta SAM 3D / SAM 2
