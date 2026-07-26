@@ -37,6 +37,8 @@ LOCK_MATCH_MAX_PX   = 140    # px; how far a candidate can be from the locked ga
 LOCK_RELEASE_DIST   = 1.3    # m; inside this range we treat the locked gate as passed
 LATERAL_CUTOFF_DIST = 2.0    # m; inside this range, stop steering and fly straight through
 GAP_SMOOTH_ALPHA    = 0.35   # EMA weight on the newest gap sample (0-1, higher = less smoothing)
+MAX_COAST_FRAMES    = 20     # ~1s at LOOP_DT=0.05; force-unlock if we've been coasting
+                              # this long with no reliable match (gate passed/left the frame)
 # ─────────────────────────────────────────────────────────────────────────────
 
 session = requests.Session()
@@ -115,6 +117,7 @@ locked_center_px = None
 smoothed_gap_x = smoothed_gap_y = 0.0
 last_gap_x = last_gap_y = 0.0
 last_dist = 3.0
+coast_frames = 0
 
 # ── main loop ─────────────────────────────────────────────────────────────────
 while True:
@@ -134,6 +137,7 @@ while True:
         smoothed_gap_x = smoothed_gap_y = 0.0
         last_gap_x = last_gap_y = 0.0
         last_dist = 3.0
+        coast_frames = 0
         continue
 
     frame = get_frame()
@@ -146,18 +150,42 @@ while True:
     cands = vis.candidates(frame)
     chosen = pick_gate(cands, locked, locked_center_px)
 
-    if chosen is not None:
+    if chosen is not None and not chosen.clipped:
         gap_x, gap_y, dist = chosen.gap_x, chosen.gap_y, chosen.distance
         det_source = chosen.source
         locked = True
         locked_center_px = chosen.center_px
         last_gap_x, last_gap_y, last_dist = gap_x, gap_y, dist
+        coast_frames = 0
+    elif chosen is not None and chosen.clipped:
+        # bbox touches the frame border -> the gate is only partially in
+        # view (almost always because we're now very close to it). Its
+        # apparent width is truncated, which inflates the computed distance
+        # and its centre is skewed toward whichever side is still visible —
+        # exactly the bad reading that was causing the late steer-and-clip.
+        # Keep tracking it (update locked_center_px so matching doesn't
+        # break) but don't trust its numbers: coast on the last good gap and
+        # clamp distance down so the lateral cutoff below is guaranteed to
+        # engage, since a clipped box is itself proof we're already close.
+        locked = True
+        locked_center_px = chosen.center_px
+        gap_x, gap_y = last_gap_x, last_gap_y
+        dist = min(last_dist, LATERAL_CUTOFF_DIST)
+        det_source = chosen.source + "*clip"
+        coast_frames = 0
     elif locked:
-        # locked gate not matched this frame (occlusion / partly out of frame
-        # while flying through it) -> coast on the last reading rather than
-        # snapping onto whatever else is in view
+        # locked gate not matched this frame (occlusion / momentarily out of
+        # frame while flying through it) -> coast on the last reading rather
+        # than snapping onto whatever else is in view. If this drags on too
+        # long the gate is behind us, not just briefly hidden -> release the
+        # lock so the next visible gate can be acquired (requirement 2).
         gap_x, gap_y, dist = last_gap_x, last_gap_y, last_dist
         det_source = "coast"
+        coast_frames += 1
+        if coast_frames > MAX_COAST_FRAMES:
+            locked = False
+            locked_center_px = None
+            coast_frames = 0
     else:
         gap_x, gap_y, dist = 0.0, 0.0, 3.0
         det_source = "none"

@@ -45,6 +45,17 @@ GATE_WIDTH_M  = 5.0     # real gate opening width (half_w 2.5 * 2)
 
 YOLO_CONF = float(os.environ.get("YOLO_CONF", "0.15"))
 
+# ── sanity-check thresholds for candidate boxes ──────────────────────────────
+# Real gates are half_w=2.5, half_h=2.0 (gates.py) -> width:height = 1.25.
+# A box whose aspect ratio is way outside this range is very likely two
+# adjacent/overlapping gates that got fused into one contour, not a real gate.
+GATE_ASPECT_MIN = 0.4
+GATE_ASPECT_MAX = 3.0
+# A box touching the frame border means the gate is partially out of the
+# camera's FOV (usually because the drone is very close to it). Its apparent
+# width/centre are then computed from a truncated shape and are unreliable.
+EDGE_MARGIN_PX = 3
+
 
 @dataclass
 class Detection:
@@ -56,6 +67,7 @@ class Detection:
     distance: float = 2.0       # metres, camera POV -> obstacle centre
     conf: float = 0.0
     source: str = "none"        # "yolo+sam" | "yolo" | "hsv" | "none"
+    clipped: bool = False       # bbox touches the frame border -> centre/width unreliable
 
 
 def set_intrinsics(focal_px=None, frame_w=None, frame_h=None, gate_width_m=None):
@@ -174,16 +186,28 @@ def _detect_yolo_all(frame):
 
 
 def _detect_hsv_all(frame):
-    """Classical fallback: return every orange-gate contour box in the frame."""
+    """Classical fallback: return every orange-gate contour box in the frame.
+
+    Uses a smaller closing kernel than the single-box detect() path (3x3 vs
+    5x5) — the 5x5 kernel was aggressive enough to bridge the gap between two
+    gates that are merely close together on screen (common here since gates
+    are z-aligned and several are visible at once), fusing them into one
+    contour with a bogus, blended centre. A box whose aspect ratio still ends
+    up nothing like a real gate's (1.25 W:H, see GATE_ASPECT_MIN/MAX) is
+    dropped rather than reported as-is.
+    """
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
     mask = cv2.inRange(hsv, (8, 120, 120), (30, 255, 255))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     out = []
     for c in contours:
         if cv2.contourArea(c) < 80:
             continue
         x, y, w, h = cv2.boundingRect(c)
+        aspect = w / max(1.0, h)
+        if aspect < GATE_ASPECT_MIN or aspect > GATE_ASPECT_MAX:
+            continue  # doesn't look like a single real gate -> likely a merged blob
         fill = cv2.contourArea(c) / max(1.0, w * h)
         out.append((float(x), float(y), float(x + w), float(y + h), float(min(1.0, fill + 0.3))))
     return out
@@ -201,8 +225,11 @@ def _box_to_detection(frame, box, source):
     distance = GATE_WIDTH_M * focal / width_px
     gap_x = (cx - w / 2.0) / (w / 2.0)
     gap_y = (h / 2.0 - cy) / (h / 2.0)
+    clipped = (x1 <= EDGE_MARGIN_PX or y1 <= EDGE_MARGIN_PX or
+               x2 >= w - EDGE_MARGIN_PX or y2 >= h - EDGE_MARGIN_PX)
     return Detection(found=True, gap_x=gap_x, gap_y=gap_y, center_px=(cx, cy),
-                      width_px=width_px, distance=distance, conf=conf, source=source)
+                      width_px=width_px, distance=distance, conf=conf, source=source,
+                      clipped=clipped)
 
 
 def candidates(frame):
