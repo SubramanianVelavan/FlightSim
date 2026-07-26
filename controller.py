@@ -25,8 +25,11 @@ HOVER_BIAS = GRAVITY / ATTRACT_K   # ≈ 1.333
 
 # ── tunables ──────────────────────────────────────────────────────────────────
 CRUISE_ALTITUDE = 2.5
-LATERAL_GAIN    = 0.20    # gap_x -> lateral target nudge
-ALTITUDE_GAIN   = 0.8     # gap_y -> altitude nudge
+# NOTE: these gains now multiply a world-space offset (gap * distance), not
+# a raw screen fraction — 1.0 means "aim squarely at the gate's estimated
+# position", <1.0 damps it slightly to stay stable under detection noise.
+LATERAL_GAIN    = 0.85    # world-space lateral target gain
+ALTITUDE_GAIN   = 0.85    # world-space vertical target gain
 Z_STEP_SEARCH   = 0.12    # creep forward when no gate is visible
 Z_STEP_MIN      = 0.10    # forward push when gate is close
 Z_STEP_MAX      = 0.25    # forward push when gate is far
@@ -39,6 +42,17 @@ LATERAL_CUTOFF_DIST = 2.0    # m; inside this range, stop steering and fly strai
 GAP_SMOOTH_ALPHA    = 0.35   # EMA weight on the newest gap sample (0-1, higher = less smoothing)
 MAX_COAST_FRAMES    = 20     # ~1s at LOOP_DT=0.05; force-unlock if we've been coasting
                               # this long with no reliable match (gate passed/left the frame)
+# physics.py's spring (ATTRACT_K=3.0, DRAG=2.5) is underdamped
+# (DRAG^2 - 4*ATTRACT_K < 0), so any target that JUMPS causes the drone to
+# overshoot and ring before settling. The distance-scaled target above can
+# jump several metres in one frame (e.g. right after locking a far-off
+# gate), which was exciting that ringing and sending the drone past
+# centreline into the gate frame. Rate-limiting how fast the commanded
+# target itself is allowed to move turns that jump into a smooth ramp —
+# gentle on the spring — while still reaching the correct position well
+# before the drone arrives at the gate.
+MAX_TARGET_STEP_X  = 0.5     # m per loop iteration (~10 m/s of target motion)
+MAX_TARGET_STEP_Y  = 0.35    # m per loop iteration
 # ─────────────────────────────────────────────────────────────────────────────
 
 session = requests.Session()
@@ -81,6 +95,20 @@ def load_intrinsics():
         print(f"[ctl] /gates not available ({e}); using vis.py defaults")
 
 
+def _rate_limit(current, desired, max_step):
+    """Move `current` toward `desired` by at most `max_step` this call.
+
+    Converts a target that would otherwise jump straight to `desired` (a
+    step input to physics.py's underdamped spring) into a bounded ramp —
+    see MAX_TARGET_STEP_X/Y above."""
+    delta = desired - current
+    if delta > max_step:
+        delta = max_step
+    elif delta < -max_step:
+        delta = -max_step
+    return current + delta
+
+
 def pick_gate(cands, locked, locked_center_px):
     """Choose which detected gate to track this frame.
 
@@ -118,6 +146,9 @@ smoothed_gap_x = smoothed_gap_y = 0.0
 last_gap_x = last_gap_y = 0.0
 last_dist = 3.0
 coast_frames = 0
+_start_status = get_status()
+target_x_state = _start_status["position"]["x"]
+target_y_state = _start_status["position"]["y"]
 
 # ── main loop ─────────────────────────────────────────────────────────────────
 while True:
@@ -138,6 +169,9 @@ while True:
         last_gap_x = last_gap_y = 0.0
         last_dist = 3.0
         coast_frames = 0
+        _reset_status = get_status()
+        target_x_state = _reset_status["position"]["x"]
+        target_y_state = _reset_status["position"]["y"]
         continue
 
     frame = get_frame()
@@ -202,21 +236,45 @@ while True:
         locked = False
         locked_center_px = None
 
-    # ── x: incremental lateral correction toward gate centre ──────────────
+    # ── x: lateral correction toward gate centre, in *world* units ─────────
+    # gap_x is a normalised screen fraction, not a distance — multiplying it
+    # by a small constant gain gave a fixed ~0.2m nudge regardless of how far
+    # off-axis the gate actually was, which was nowhere near enough for a
+    # gate sitting far to one side (it ran out of forward distance before
+    # catching up laterally). Converting through the pinhole model instead:
+    # with FOV_DEG=90 the horizontal conversion is exact —
+    #   world_x_offset = gap_x * distance
+    # — a gate that's 4m to the right at 12m out now produces a target ~4m
+    # to the right, instead of taking dozens of frames to crawl there at a
+    # flat 0.2m/step.
     if dist <= LATERAL_CUTOFF_DIST:
         # this close, further steering fights the spring physics into an
         # overshoot instead of helping — hold heading and fly straight through
-        target_x = pos["x"]
+        desired_x = pos["x"]
     else:
-        target_x = pos["x"] + smoothed_gap_x * LATERAL_GAIN
+        desired_x = pos["x"] + smoothed_gap_x * dist * LATERAL_GAIN
+    # Rate-limit the *commanded* target rather than jumping straight to
+    # desired_x — physics.py's spring is underdamped, so a target that jumps
+    # several metres in one frame causes the drone to overshoot past
+    # centreline and clip the gate frame on the way through. Ramping the
+    # target instead keeps the spring's input smooth while still reaching
+    # the correct position well before the drone arrives at the gate.
+    target_x_state = _rate_limit(target_x_state, desired_x, MAX_TARGET_STEP_X)
+    target_x = target_x_state
 
     # ── y: hover bias (fight gravity) + steer toward gate centre ──────────
+    # Same world-unit conversion for the vertical axis. The vertical FOV
+    # isn't equal to the horizontal FOV (frame is 640x480, not square), so
+    # the conversion factor picks up the frame's height/width ratio.
     if have_gate:
-        altitude_correction = smoothed_gap_y * ALTITUDE_GAIN
+        vertical_scale = vis.FRAME_H / float(vis.FRAME_W)
+        altitude_correction = smoothed_gap_y * dist * vertical_scale * ALTITUDE_GAIN
     else:
         altitude_correction = (CRUISE_ALTITUDE - pos["y"]) * 0.3
-    target_y = pos["y"] + HOVER_BIAS + altitude_correction
-    target_y = max(1.0, min(12.0, target_y))   # safety clamp
+    desired_y = pos["y"] + HOVER_BIAS + altitude_correction
+    desired_y = max(1.0, min(12.0, desired_y))   # safety clamp
+    target_y_state = _rate_limit(target_y_state, desired_y, MAX_TARGET_STEP_Y)
+    target_y = target_y_state
 
     # ── z: forward thrust, ease off when badly off-centre ─────────────────
     if have_gate:
