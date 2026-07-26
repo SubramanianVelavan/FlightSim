@@ -154,6 +154,76 @@ def _detect_hsv(frame):
     return float(x), float(y), float(x + w), float(y + h), float(min(1.0, fill + 0.3))
 
 
+def _detect_yolo_all(frame):
+    """Return every gate box the model sees this frame (not just the largest).
+
+    Needed so the controller can look at *all* gates simultaneously in view
+    and decide for itself which one to keep tracking (gate-lock), instead of
+    vis.py silently collapsing to a single 'best' box every call."""
+    model = _load_yolo()
+    if model is None:
+        return []
+    results = model(frame, conf=YOLO_CONF, verbose=False)
+    boxes = results[0].boxes
+    if boxes is None or len(boxes) == 0:
+        return []
+    xyxy = boxes.xyxy.cpu().numpy()
+    confs = boxes.conf.cpu().numpy() if boxes.conf is not None else np.ones(len(xyxy))
+    return [(float(x1), float(y1), float(x2), float(y2), float(c))
+            for (x1, y1, x2, y2), c in zip(xyxy, confs)]
+
+
+def _detect_hsv_all(frame):
+    """Classical fallback: return every orange-gate contour box in the frame."""
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    mask = cv2.inRange(hsv, (8, 120, 120), (30, 255, 255))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    out = []
+    for c in contours:
+        if cv2.contourArea(c) < 80:
+            continue
+        x, y, w, h = cv2.boundingRect(c)
+        fill = cv2.contourArea(c) / max(1.0, w * h)
+        out.append((float(x), float(y), float(x + w), float(y + h), float(min(1.0, fill + 0.3))))
+    return out
+
+
+def _box_to_detection(frame, box, source):
+    """Turn a raw (x1,y1,x2,y2,conf) box into a Detection (no SAM refine — SAM
+    is single-target and only makes sense once we already know which gate we
+    care about, so multi-gate candidates() skips it for speed)."""
+    h, w = frame.shape[:2]
+    x1, y1, x2, y2, conf = box
+    cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+    width_px = max(1.0, x2 - x1)
+    focal = FOCAL_PX * (w / float(FRAME_W))
+    distance = GATE_WIDTH_M * focal / width_px
+    gap_x = (cx - w / 2.0) / (w / 2.0)
+    gap_y = (h / 2.0 - cy) / (h / 2.0)
+    return Detection(found=True, gap_x=gap_x, gap_y=gap_y, center_px=(cx, cy),
+                      width_px=width_px, distance=distance, conf=conf, source=source)
+
+
+def candidates(frame):
+    """Every visible gate this frame, nearest (largest box) first.
+
+    Unlike detect(), which collapses to a single 'best' box, this exposes
+    every candidate so the controller can implement gate-lock: match against
+    the previously-locked gate's position instead of always grabbing
+    whichever box happens to look biggest/most confident this frame.
+    """
+    boxes = _detect_yolo_all(frame)
+    source = "yolo"
+    if not boxes:
+        boxes = _detect_hsv_all(frame)
+        source = "hsv"
+    if not boxes:
+        return []
+    boxes.sort(key=lambda b: (b[2] - b[0]) * (b[3] - b[1]), reverse=True)  # largest = nearest
+    return [_box_to_detection(frame, b, source) for b in boxes]
+
+
 def _refine_with_sam(frame, box):
     """Use SAM (box prompt) to get a tight mask; return (cx, cy, width_px) or None."""
     predictor = _load_sam()
